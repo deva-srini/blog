@@ -1,6 +1,6 @@
 # Deva's ML Notes
 
-Personal blog documenting projects, papers, and learnings in ML, LLMs, and AI.
+Personal blog documenting projects, papers, and learnings in ML, LLMs, and AI
 
 Built with [Jekyll](https://jekyllrb.com/) and hosted on [GitHub Pages](https://pages.github.com/).
 
