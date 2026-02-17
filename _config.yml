@@ -1,0 +1,30 @@
+title: Deva's ML Notes
+description: Projects, papers, and learnings in ML, LLMs, and AI.
+url: "https://deva-srini.github.io"
+baseurl: "/blog"
+
+theme: minima
+
+author:
+  name: Deva
+
+# Build settings
+markdown: kramdown
+highlighter: rouge
+
+# Permalink structure
+permalink: /:year/:month/:day/:title/
+
+# Show excerpts on homepage
+show_excerpts: true
+
+# Plugins
+plugins:
+  - jekyll-feed
+  - jekyll-seo-tag
+
+# Exclude from build
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - README.md
