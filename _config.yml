@@ -5,8 +5,7 @@ baseurl: "/blog"
 
 theme: minima
 
-author:
-  name: Deva
+author: Deva
 
 # Build settings
 markdown: kramdown
@@ -28,3 +27,4 @@ exclude:
   - Gemfile
   - Gemfile.lock
   - README.md
+  - CLAUDE.md

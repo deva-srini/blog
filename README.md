@@ -12,3 +12,7 @@ bundle exec jekyll serve
 ```
 
 Then open [http://localhost:4000/blog/](http://localhost:4000/blog/).
+
+
+
+
