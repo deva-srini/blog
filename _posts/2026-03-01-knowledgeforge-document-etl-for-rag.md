@@ -5,28 +5,39 @@ date: 2026-03-01
 categories: projects rag
 ---
 
-Building a RAG system is straightforward until you realize that the hard part isn't the retrieval or the generation -- it's curating the knowledge that feeds it. How do you go from a folder of PDFs, Word docs, and PowerPoint decks to a clean, chunked, indexed knowledge base? And how do you track what happened to each document along the way?
+Building a RAG system is straightforward until you realize that the hard part isn't just the retrieval or the generation -- it's curating the knowledge that feeds it. How do you go from a folder of PDFs, Word docs, and PowerPoint decks to a clean, chunked, indexed knowledge base? And how do you track what happened to each document along the way?
 
-KnowledgeForge is a minimal ETL workflow framework I built to solve exactly this problem. It takes documents in, processes them through a structured pipeline, and produces indexed, queryable chunks in a vector database -- with full lineage tracking from source file to stored embedding.
+KnowledgeForge grew out of that process -- not as a planned tool, but as the thing I kept reaching for while working through each of these problems. What started as a few scripts to wrangle PDFs turned into a structured ETL framework: a sequential pipeline that takes documents in, processes them through well-defined stages, and produces indexed, queryable chunks in a vector database -- with full lineage tracking from source file to stored embedding.
 
-## Why I Built This
+## KnowledgeForge Background
 
-When I built my first RAG system, I couldn't find a minimal, opinionated tool for the document-to-knowledge pipeline. There were plenty of libraries for individual steps -- parsing, chunking, embedding -- but I wanted a simple workfly that tied all these steps together into a trackable workflow. Some of basic checks which I had to repeatedly keep track of
+The questions I kept running into were mundane but persistent:
 
 - Which version of this PDF is actually in my vector store right now?
 - Did the chunking step fail silently on some documents?
 - How do I reprocess a document when the source file changes?
 
-I started working on KnowledgeForge to solve for these and as a way to deeply understand each stage of knowledge curation for RAG systems. It's built around [Docling](https://github.com/docling-project/docling), which provides deep document understanding (layout analysis, table structure recognition, OCR), and layers on top of it: workflow orchestration, automated file monitoring, observability, and indexing into ChromaDB.
+Solving each of them individually left me with a growing set of scripts and utilities that were clearly trying to be something more coherent. It's built around [Docling](https://github.com/docling-project/docling) for deep document understanding -- layout analysis, table structure recognition, OCR -- and layers on top of it the operational pieces I kept needing.
+
+Here's what that turned into:
+
+- **Automated file watching** — a folder watcher that detects new and changed documents and triggers the full pipeline automatically, no manual intervention needed
+- **SHA-256 versioning** — every document is fingerprinted on arrival; unchanged files are skipped, changed files get a new version and a clean re-index, while the full history stays intact in the database
+- **Workflow system** — multiple document workflows (e.g. `fund_factsheets`, `annual_reports`) run concurrently with independent watch folders, chunk sizes, and ChromaDB collections, hot-reloaded without restarting the service
+- **Post-indexing analysis** — two standalone tools for auditing what's in the knowledge base: a vector index summarizer that produces a structured TOML snapshot of all collections, and an overlap detector that finds semantically duplicate content within or across collections using cosine similarity
 
 ## Architecture Overview
 
-The core idea is a **six-stage sequential pipeline** that every document passes through:
+The core idea is a **six-stage sequential pipeline** that every document passes through, followed by two post-indexing analysis tools:
 
 ```
 Source File  -->  Parse  -->  Extract  -->  Transform  -->  Chunk  -->  Embed  -->  Index
    (PDF)        (Docling)   (content     (normalize     (structure   (vectors)   (ChromaDB)
                              traversal)   + cleanup)      aware)
+
+                                                      Post-indexing analysis:
+                                                      Summarize  -->  Overlap Detection
+                                                      (TOML)          (cosine similarity)
 ```
 
 Each stage is independently toggleable, tracked in a SQLite database, and produces metadata that forms the document's processing lineage. If any stage fails, the pipeline stops and records exactly where and why.
@@ -151,6 +162,75 @@ indexing:
     "reports/*.pdf": "reports_collection"
 ```
 
+## Post-Indexing Analysis
+
+Once documents are indexed, two questions come up almost immediately: *what's actually in my vector store?* and *is there redundant content that will confuse retrieval?* These are hard to answer by querying ChromaDB directly -- you'd have to iterate through collections, aggregate metadata, and eyeball similarity yourself. I added two standalone tools to handle this.
+
+### Vector Index Summarizer
+
+The `VectorIndexSummarizer` scans all ChromaDB collections and produces a structured TOML summary of everything that's been indexed:
+
+```bash
+python cli.py summary
+python cli.py summary --output ./reports/index_snapshot.toml
+```
+
+For each collection it reports chunk counts, content types, and embedding metadata. For each document within a collection it breaks down chunk count, total tokens, content types present, and the section headers found. Running it against a freshly indexed factsheet produces something like:
+
+```
+Collections scanned: 1
+Total chunks       : 33
+Embedding model    : sentence-transformers/all-MiniLM-L6-v2
+Embedding dim      : 384
+
+Collection: 'fund_factsheets'
+  Document: 'bgf_factsheet.pdf' (v1)
+    Chunks   : 33
+    Tokens   : 3,048
+    Types    : ['image_description', 'table', 'text']
+    Sections : ['CUMULATIVE & ANNUALISED PERFORMANCE', 'INVESTMENT OBJECTIVE', ...]
+```
+
+The TOML output is designed to be machine-readable -- you can pass it as context to a RAG system's LLM so it knows upfront what knowledge is available before it even starts retrieving. Instead of blind retrieval, the model can say *"I have fund factsheets covering X, Y, Z topics"* before answering.
+
+You can also attach human-readable descriptions per document in the config, which get embedded into the summary:
+
+```yaml
+indexing:
+  document_descriptions:
+    bgf_factsheet.pdf: "BlackRock World Technology Fund factsheet, December 2025"
+```
+
+### Overlap Detection
+
+The `OverlapDetector` answers a different question: are there chunks in my knowledge base that are saying the same thing? This matters more than it sounds. Duplicate or near-duplicate content inflates retrieval scores for certain topics, makes your RAG answers repetitive, and is usually a sign that you've indexed the same document twice under different names or versions.
+
+```bash
+# Check for overlaps within a single collection
+python cli.py overlap --collection fund_factsheets
+
+# Compare two collections against each other
+python cli.py overlap --source fund_factsheets --target annual_reports --threshold 0.9
+```
+
+It works by fetching all embeddings from the collection, running a batch cosine similarity query, and filtering to pairs above the threshold. Symmetric duplicates are deduplicated so you don't see A→B and B→A reported separately. The output is a ranked list of overlapping chunk pairs with a similarity score and a content preview:
+
+```
+Overlap Report: within-collection "fund_factsheets"
+  Chunks analyzed: 33
+  Threshold: 0.85
+  Overlaps found: 4
+
+  Matches:
+    1. [0.97] doc_abc_5 (factsheet_q3.pdf) ~ doc_xyz_5 (factsheet_q4.pdf)
+       "The Fund invests globally at least 70% of its total assets..."  ~
+       "The Fund invests globally at least 70% of its total assets..."
+```
+
+A similarity of 1.0 almost always means the exact same content indexed twice -- usually from processing the same document under different versions or filenames. Scores in the 0.85-0.95 range are more interesting: similar but not identical, which might indicate boilerplate that appears across multiple documents or sections that were updated between versions.
+
+Both tools run entirely post-hoc and are decoupled from the ingestion pipeline -- you can run them on any existing ChromaDB collection without reprocessing anything.
+
 ## Multi-Workflow Support
 
 A single KnowledgeForge instance can run multiple workflows, each with its own watch folder, processing settings, and target collection. Workflows are registered in a central registry:
@@ -232,12 +312,12 @@ Behind the scenes:
 3. Staged to data/staging/bgf_factsheet.pdf
 4. Document record created (status: pending)
 5. Pipeline triggered:
-   Parse:     4 pages, 3373 tokens, 98 items         [~5s warm]
-   Extract:   98 items with headers + table markdown   [<1s]
-   Transform: Unicode normalization + markdown export   [<1s]
-   Chunk:     33 chunks (256-token limit, 50 overlap)  [<1s]
-   Embed:     33 x 384-dim vectors                     [~3s]
-   Index:     33 chunks -> "fund_factsheets" collection [<1s]
+   Parse:     4 pages, 3373 tokens, 98 items
+   Extract:   98 items with headers + table markdown
+   Transform: Unicode normalization + markdown export
+   Chunk:     33 chunks (256-token limit, 50 overlap)
+   Embed:     33 x 384-dim vectors
+   Index:     33 chunks -> "fund_factsheets" collection
 6. Document status -> "indexed"
 7. Lineage recorded for all 6 stages
 ```
@@ -250,14 +330,19 @@ cp bgf_factsheet_v2.pdf data/source/factsheets/bgf_factsheet.pdf
 
 KnowledgeForge detects the hash change, bumps to version 2, deletes old chunks from ChromaDB, and reprocesses the updated file -- all automatically.
 
-## What's Next
+Once ingestion is done, you can inspect and audit the knowledge base from the CLI:
 
-KnowledgeForge is a work-in-progress. Here's what's planned:
+```bash
+# Summarize all indexed collections to a TOML file
+python cli.py summary
+python cli.py summary --output ./reports/index_snapshot.toml
 
-- **Knowledge base index page**: Generate an index/summary of all indexed documents and pass it as context to the RAG answer LLM, so it knows what knowledge is available before retrieval
-- **AI-assisted document reconstruction**: Use an LLM agent to review and correct Docling's parsed structure, fixing misclassified headers, tables, and text blocks in complex PDFs
-- **Automated evaluation on ingestion**: Run minimal quality checks whenever a workflow processes a new or updated file -- catch regressions in parsing or chunking quality
-- **Cross-document similarity detection**: Identify overlapping or conflicting content across documents at ingestion time, flagging duplicates or contradictions before they enter the knowledge base
+# Check for semantic overlaps within a collection
+python cli.py overlap --collection fund_factsheets
+
+# Compare two collections against each other
+python cli.py overlap --source fund_factsheets --target annual_reports --threshold 0.9
+```
 
 ## More Information
 
@@ -265,4 +350,4 @@ KnowledgeForge is open source. Check the [GitHub repository](https://github.com/
 
 ---
 
-*This is part of my ongoing exploration of building production-grade RAG systems. If you're working on similar problems, I'd love to hear about your approach.*
+*This is part of my ongoing exploration of building RAG systems. If you're working on similar problems, I'd love to hear about your approach.*
